@@ -14,7 +14,8 @@ import { createServer as createHttpsServer } from 'https';
 import { readFileSync, existsSync } from 'fs';
 import { WebSocketServer } from 'ws';
 import { createClient as createDeepgramClient } from '@deepgram/sdk';
-import { ElevenLabsClient } from 'elevenlabs';
+// Lazy-loaded ElevenLabs client — import only when needed
+
 import { Readable } from 'stream';
 
 // ─── Config ────────────────────────────────────────────────────────────────
@@ -28,15 +29,24 @@ const TTS_PROVIDER = process.env.TTS_PROVIDER || 'deepgram'; // 'deepgram' or 'e
 // ─── Services ──────────────────────────────────────────────────────────────
 
 let deepgram;
-let elevenlabs;
+let elevenlabs = null;
 
 if (DEEPGRAM_API_KEY) {
   deepgram = createDeepgramClient(DEEPGRAM_API_KEY);
 }
 
-if (ELEVENLABS_API_KEY) {
-  elevenlabs = new ElevenLabsClient({ apiKey: ELEVENLABS_API_KEY });
-}
+// Lazy ElevenLabs init — only import the package when actually needed
+const initElevenlabs = async () => {
+  if (elevenlabs !== null || !ELEVENLABS_API_KEY) return elevenlabs;
+  try {
+    const mod = await import('elevenlabs');
+    elevenlabs = new mod.ElevenLabsClient({ apiKey: ELEVENLABS_API_KEY });
+  } catch {
+    elevenlabs = false;
+  }
+  return elevenlabs || null;
+};
+
 
 // ─── App ───────────────────────────────────────────────────────────────────
 
@@ -66,7 +76,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     deepgram: !!deepgram,
-    tts: TTS_PROVIDER + ' ' + (TTS_PROVIDER === 'deepgram' ? !!deepgram : !!elevenlabs),
+    tts: TTS_PROVIDER + ' ' + (TTS_PROVIDER === 'deepgram' ? !!deepgram : !!ELEVENLABS_API_KEY),
   });
 });
 
@@ -124,7 +134,7 @@ function createDeepgramStream(onTranscript, onError) {
 
 async function streamTTS(ws, text) {
   try {
-    if (TTS_PROVIDER === 'elevenlabs' && elevenlabs) {
+    if (TTS_PROVIDER === 'elevenlabs') {
       return await elevenlabsTTS(ws, text);
     } else if (deepgram) {
       return await deepgramTTS(ws, text);
@@ -155,7 +165,9 @@ async function deepgramTTS(ws, text) {
 }
 
 async function elevenlabsTTS(ws, text, voice = '21m00Tcm4TlvDq8ikWAM') {
-  const audioStream = await elevenlabs.generate({
+  const el = await initElevenlabs();
+  if (!el) throw new Error('ElevenLabs not available');
+  const audioStream = await el.generate({
     voice,
     text,
     model_id: 'eleven_turbo_v2',
@@ -282,7 +294,7 @@ async function handleAgentMessage(ws, text) {
     ws.send(JSON.stringify({ type: 'reply', text: reply }));
 
     // Stream TTS audio back
-    if (deepgram || elevenlabs) {
+    if (deepgram || ELEVENLABS_API_KEY) {
       broadcastStatus('speaking');
       try {
         await streamTTS(ws, reply);
@@ -357,6 +369,7 @@ server.listen(listenPort, HOST, () => {
   const proto = hasCerts ? 'https' : 'http';
   console.log(`  → ${proto}://localhost:${listenPort}`);
   console.log(`  → STT: ${deepgram ? 'Deepgram ✓' : 'Deepgram ✗'}`);
-  console.log(`  → TTS: ${TTS_PROVIDER} ${TTS_PROVIDER === 'deepgram' && deepgram || TTS_PROVIDER === 'elevenlabs' && elevenlabs ? '✓' : '✗'}`);
+  const ttsOk = TTS_PROVIDER === 'deepgram' ? !!deepgram : !!ELEVENLABS_API_KEY;
+  console.log(`  → TTS: ${TTS_PROVIDER} ${ttsOk ? '✓' : '✗'}`);
   console.log();
 });
