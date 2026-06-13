@@ -49,7 +49,18 @@ const server = hasCerts
   ? createHttpsServer({ key: readFileSync('key.pem'), cert: readFileSync('cert.pem') }, app)
   : createHttpServer(app);
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  maxPayload: 1024 * 1024, // 1MB max audio
+  perMessageDeflate: false,
+});
+
+// Accept WebSocket upgrades on /ws path for Railway compatibility
+server.on('upgrade', (request, socket, head) => {
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
+});
 
 app.get('/health', (req, res) => {
   res.json({
