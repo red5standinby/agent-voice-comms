@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Voice Comms ⚡</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 480px;
+      padding: 2rem;
+      text-align: center;
+    }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; color: #fff; }
+    .subtitle { font-size: 0.875rem; color: #888; margin-bottom: 2rem; }
+    .status-dot {
+      display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+      margin-right: 6px; vertical-align: middle;
+    }
+    .status-dot.connected { background: #22c55e; }
+    .status-dot.disconnected { background: #ef4444; }
+    .status-dot.connecting { background: #f59e0b; }
+    .status-dot.listening { background: #3b82f6; animation: pulse 1s infinite; }
+    .status-dot.speaking { background: #a855f7; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .status-text { font-size: 0.875rem; color: #aaa; margin-bottom: 1.5rem; }
+    .mic-btn {
+      width: 96px; height: 96px; border-radius: 50%; border: 3px solid #333;
+      background: #14141f; color: #fff; font-size: 2.5rem; cursor: pointer;
+      transition: all 0.2s ease; display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 1.5rem;
+    }
+    .mic-btn:hover { border-color: #555; background: #1a1a2e; }
+    .mic-btn.active { border-color: #3b82f6; background: #1e3a5f; box-shadow: 0 0 30px rgba(59,130,246,0.3); }
+    .mic-btn.speaking { border-color: #a855f7; background: #3b1f5e; box-shadow: 0 0 30px rgba(168,85,247,0.3); }
+    .transcript-box {
+      background: #111118; border: 1px solid #222; border-radius: 12px;
+      padding: 1rem; min-height: 80px; margin-bottom: 1rem;
+      text-align: left; font-size: 0.9rem; line-height: 1.5;
+    }
+    .transcript-box .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #666; margin-bottom: 0.5rem; }
+    .transcript-box .text { color: #ccc; }
+    .transcript-box .text.final { color: #fff; }
+    .reply-box {
+      background: #0d0d15; border: 1px solid #1a1a2e; border-radius: 12px;
+      padding: 1rem; min-height: 60px; text-align: left; font-size: 0.9rem; line-height: 1.5;
+    }
+    .reply-box .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #3b82f6; margin-bottom: 0.5rem; }
+    .reply-box .text { color: #aaccff; }
+    .vumeter { display: flex; gap: 4px; justify-content: center; margin-bottom: 1rem; height: 30px; align-items: flex-end; }
+    .vumeter-bar { width: 6px; border-radius: 3px; background: #3b82f6; transition: height 0.05s ease; opacity: 0; }
+    .vumeter.active .vumeter-bar { opacity: 1; }
+    .error { color: #ef4444; font-size: 0.8rem; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⚡ Agent Voice</h1>
+    <p class="subtitle">Talk to Volt Labs agents</p>
+    
+    <div class="status-text">
+      <span class="status-dot disconnected" id="statusDot"></span>
+      <span id="statusLabel">Disconnected</span>
+    </div>
+
+    <div class="vumeter" id="vumeter">
+      <div class="vumeter-bar" id="v0"></div>
+      <div class="vumeter-bar" id="v1"></div>
+      <div class="vumeter-bar" id="v2"></div>
+      <div class="vumeter-bar" id="v3"></div>
+      <div class="vumeter-bar" id="v4"></div>
+      <div class="vumeter-bar" id="v5"></div>
+      <div class="vumeter-bar" id="v6"></div>
+      <div class="vumeter-bar" id="v7"></div>
+    </div>
+
+    <button class="mic-btn" id="micBtn">🎤</button>
+    
+    <div class="transcript-box">
+      <div class="label">You</div>
+      <div class="text" id="transcriptText">Press the mic and start speaking...</div>
+    </div>
+    
+    <div class="reply-box">
+      <div class="label">Agent</div>
+      <div class="text" id="replyText">Waiting for input...</div>
+    </div>
+    
+    <div class="error" id="error"></div>
+    <pre id="log" style="font-size:0.6rem;color:#666;text-align:left;margin-top:1rem;padding:0.5rem;background:#08080f;border-radius:8px;max-height:120px;overflow-y:auto;white-space:pre-wrap;"></pre>
+  </div>
+
+  <script>
+    // ─── On-screen logger ─────────────────────────────────────────────────
+    function log(msg) {
+      const el = document.getElementById('log');
+      if (el) {
+        el.textContent += '\n[' + new Date().toLocaleTimeString() + '] ' + msg;
+        el.scrollTop = el.scrollHeight;
+      }
+      console.log('[comms]', msg);
+    }
+
+    // ─── State ────────────────────────────────────────────────────────────
+    const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+    let ws = null;
+    let audioCtx = null;
+    let analyser = null;
+    let stream = null;
+    let processor = null;
+    let source = null;
+    let isRecording = false;
+    let isSpeaking = false;
+    let vuInterval = null;
+    
+    // DOM refs
+    const micBtn = document.getElementById('micBtn');
+    const statusDot = document.getElementById('statusDot');
+    const statusLabel = document.getElementById('statusLabel');
+    const transcriptText = document.getElementById('transcriptText');
+    const replyText = document.getElementById('replyText');
+    const errorEl = document.getElementById('error');
+    const vumeter = document.getElementById('vumeter');
+    const vuBars = Array.from({ length: 8 }, (_, i) => document.getElementById(`v${i}`));
+
+    // ─── WebSocket ────────────────────────────────────────────────────────
+    let reconnectTimer = null;
+    
+    function connect() {
+      log('Connecting to ' + WS_URL);
+      setStatus('connecting');
+      ws = new WebSocket(WS_URL);
+      
+      ws.onopen = () => {
+        log('WebSocket connected');
+        setStatus('connected');
+        errorEl.textContent = '';
+      };
+      
+      ws.onclose = (e) => {
+        log('WebSocket closed: code=' + e.code);
+        setStatus('disconnected');
+        if (isRecording) stopMic();
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 2000);
+      };
+      
+      ws.onerror = () => {
+        log('WebSocket error');
+        errorEl.textContent = 'Connection error — server may be offline';
+      };
+      
+      ws.onmessage = async (event) => {
+        if (event.data instanceof Blob) {
+          log('Received audio blob (' + event.data.size + ' bytes)');
+          await playAudio(event.data);
+          return;
+        }
+        
+        try {
+          const msg = JSON.parse(event.data);
+          
+          switch (msg.type) {
+            case 'status':
+              log('Status: ' + msg.message);
+              if (msg.message === 'listening') { setStatus('listening'); }
+              else if (msg.message === 'speaking') { setStatus('speaking'); }
+              else if (msg.message === 'thinking...') { setStatus('thinking...'); }
+              else { statusLabel.textContent = msg.message; }
+              break;
+            case 'interim':
+              transcriptText.textContent = msg.text;
+              transcriptText.className = 'text';
+              break;
+            case 'final':
+              transcriptText.textContent = msg.text;
+              transcriptText.className = 'text final';
+              break;
+            case 'reply':
+              replyText.textContent = msg.text;
+              break;
+            case 'error':
+              errorEl.textContent = msg.message;
+              break;
+          }
+        } catch (e) {
+          log('Parse error: ' + e.message);
+        }
+      };
+    }
+
+    // ─── Audio Playback ───────────────────────────────────────────────────
+    async function playAudio(blob) {
+      if (!audioCtx) return;
+      
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioCtx.destination);
+      source.start();
+    }
+
+    // ─── Mic + Raw PCM Capture ────────────────────────────────────────────
+    async function startMic() {
+      try {
+        // Check WS is ready first
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          log('WebSocket not ready, waiting...');
+          errorEl.textContent = 'Waiting for connection...';
+          return;
+        }
+
+        log('Requesting mic access...');
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            sampleRate: 16000,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+          }
+        });
+        log('Mic granted. Tracks: ' + stream.getAudioTracks().length);
+
+        // Audio context for VU meter only
+        audioCtx = new AudioContext({ sampleRate: 16000 });
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        source = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        startVUMeter();
+        
+        // Tell server to start Deepgram stream FIRST
+        log('Sending start signal...');
+        ws.send(JSON.stringify({ type: 'start' }));
+        log('Start signal sent');
+        
+        isRecording = true;
+        setStatus('listening');
+        transcriptText.textContent = 'Listening...';
+        replyText.textContent = '';
+        
+        // Create ScriptProcessorNode for raw PCM capture
+        const scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
+        source.connect(scriptNode);
+        scriptNode.connect(audioCtx.destination);
+        
+        let totalSent = 0;
+        scriptNode.onaudioprocess = (e) => {
+          if (!isRecording || isSpeaking) return;
+          try {
+            const input = e.inputBuffer.getChannelData(0);
+            const pcm = new Int16Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+              const s = Math.max(-1, Math.min(1, input[i]));
+              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(pcm.buffer);
+              totalSent++;
+              if (totalSent % 10 === 0) log('Sent ' + totalSent + ' PCM chunks');
+            }
+          } catch (err) {
+            log('PCM send error: ' + err.message);
+          }
+        };
+        processor = scriptNode;
+        log('ScriptProcessorNode connected');
+        
+      } catch (err) {
+        errorEl.textContent = 'Mic error: ' + err.message;
+        log('Mic error: ' + err.message);
+      }
+    }
+
+    function stopMic() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'end' }));
+      }
+      
+      if (processor) {
+        processor.disconnect();
+        processor = null;
+      }
+      if (source) source.disconnect();
+      if (audioCtx) audioCtx.close();
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      
+      stopVUMeter();
+      isRecording = false;
+      setStatus('connected');
+      stream = null;
+      audioCtx = null;
+    }
+
+    // ─── VU Meter ─────────────────────────────────────────────────────────
+    function startVUMeter() {
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      vumeter.classList.add('active');
+      
+      vuInterval = setInterval(() => {
+        analyser.getByteFrequencyData(dataArray);
+        const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        const level = Math.min(1, avg / 128);
+        const barCount = Math.round(level * 8);
+        
+        for (let i = 0; i < 8; i++) {
+          vuBars[i].style.height = `${Math.max(4, (i + 1) * 4 * level)}px`;
+          vuBars[i].style.opacity = i < barCount ? '1' : '0.2';
+        }
+      }, 50);
+    }
+
+    function stopVUMeter() {
+      clearInterval(vuInterval);
+      vumeter.classList.remove('active');
+      vuBars.forEach(b => { b.style.height = '4px'; b.style.opacity = '0.2'; });
+    }
+
+    // ─── UI ───────────────────────────────────────────────────────────────
+    function setStatus(state) {
+      statusDot.className = 'status-dot ' + state;
+      const labels = {
+        connected: 'Connected',
+        disconnected: 'Disconnected',
+        connecting: 'Connecting...',
+        listening: 'Listening...',
+        speaking: 'Speaking...',
+        'thinking...': 'Thinking...',
+      };
+      statusLabel.textContent = labels[state] || state;
+      
+      micBtn.className = 'mic-btn';
+      if (state === 'listening') micBtn.classList.add('active');
+      if (state === 'speaking') micBtn.classList.add('speaking');
+    }
+
+    // ─── Toggle Mic ───────────────────────────────────────────────────────
+    micBtn.addEventListener('click', () => {
+      if (isRecording) stopMic();
+      else startMic();
+    });
+
+    // ─── Keyboard shortcut ────────────────────────────────────────────────
+    document.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' && !e.repeat && !e.target.matches('input, textarea')) {
+        e.preventDefault();
+        if (isRecording) stopMic();
+        else startMic();
+      }
+    });
+
+    // ─── Init ─────────────────────────────────────────────────────────────
+    connect();
+    console.log('Agent Voice Comms ⚡ ready');
+  </script>
+</body>
+</html>
