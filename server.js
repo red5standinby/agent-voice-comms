@@ -173,78 +173,88 @@ async function elevenlabsTTS(ws, text, voice = '21m00Tcm4TlvDq8ikWAM') {
 
 // ─── WebSocket ─────────────────────────────────────────────────────────────
 
-wss.on('connection', (ws) => {
-  console.log('[ws] client connected');
+wss.on('connection', (ws, req) => {
+  const clientIp = req.socket?.remoteAddress || 'unknown';
+  console.log('[ws] client connected from', clientIp);
   let dgStream = null;
   let isRecording = false;
 
-  // Keepalive ping every 15s to prevent iOS from killing idle WS
+  // Keepalive ping every 10s to keep proxy connections alive
   const keepalive = setInterval(() => {
     if (ws.readyState === ws.OPEN) {
       ws.ping();
     }
-  }, 15000);
+  }, 10000);
+
+  const safeSend = (msg) => {
+    try {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(typeof msg === 'string' ? msg : JSON.stringify(msg));
+      }
+    } catch (e) {
+      console.error('[ws] send error:', e.message);
+    }
+  };
 
   ws.on('message', (data, isBinary) => {
-    // ── Binary audio data ──
-    if (isBinary) {
-      console.log('[ws] audio chunk:', data.length, 'bytes');
-      if (dgStream && isRecording) {
-        dgStream.send(data);
-      } else if (!deepgram) {
-        if (!ws._echoBuffer) ws._echoBuffer = Buffer.alloc(0);
-        ws._echoBuffer = Buffer.concat([ws._echoBuffer, data]);
-        if (ws._echoBuffer.length > 32000) {
-          ws.send(JSON.stringify({ type: 'text', text: `[echo] received ${ws._echoBuffer.length} bytes` }));
-          ws._echoBuffer = null;
-        }
-      }
-      return;
-    }
-
-    // ── JSON control messages ──
     try {
+      // ── Binary audio data ──
+      if (isBinary) {
+        if (dgStream && isRecording) {
+          dgStream.send(data);
+        } else if (!deepgram) {
+          if (!ws._echoBuffer) ws._echoBuffer = Buffer.alloc(0);
+          ws._echoBuffer = Buffer.concat([ws._echoBuffer, data]);
+          if (ws._echoBuffer.length > 32000) {
+            safeSend({ type: 'text', text: `[echo] received ${ws._echoBuffer.length} bytes` });
+            ws._echoBuffer = null;
+          }
+        }
+        return;
+      }
+
+      // ── JSON control messages ──
       const text = data.toString();
-      console.log('[ws] text msg:', text.substring(0, 80));
+      console.log('[ws] text:', text.substring(0, 100));
       const msg = JSON.parse(text);
 
-      switch (msg.type) {
-        case 'start':
-          console.log('[ws] start recording');
-          isRecording = true;
+      if (msg.type === 'start') {
+        console.log('[ws] start recording');
+        isRecording = true;
 
-          if (deepgram) {
-            dgStream = createDeepgramStream(
-              (transcript, isFinal) => {
-                ws.send(JSON.stringify({ type: isFinal ? 'final' : 'interim', text: transcript }));
-                if (isFinal) {
-                  handleAgentMessage(ws, transcript);
-                }
-              },
-              (err) => ws.send(JSON.stringify({ type: 'error', message: `STT error: ${err}` }))
-            );
+        if (deepgram) {
+          dgStream = createDeepgramStream(
+            (transcript, isFinal) => {
+              safeSend({ type: isFinal ? 'final' : 'interim', text: transcript });
+              if (isFinal) {
+                handleAgentMessage(ws, transcript).catch(err => {
+                  console.error('[agent] error:', err.message);
+                  safeSend({ type: 'error', message: 'Agent error' });
+                });
+              }
+            },
+            (err) => safeSend({ type: 'error', message: `STT error: ${err}` })
+          );
 
-            if (dgStream) {
-              console.log('[dg] ready for audio');
-              ws.send(JSON.stringify({ type: 'status', message: 'listening' }));
-            }
-          } else {
-            ws.send(JSON.stringify({ type: 'status', message: 'listening (echo mode)' }));
-          }
-          break;
-
-        case 'end':
-          console.log('[ws] stop recording');
-          isRecording = false;
           if (dgStream) {
-            try { dgStream.finish(); } catch {}
-            dgStream = null;
+            safeSend({ type: 'status', message: 'listening' });
+          } else {
+            safeSend({ type: 'error', message: 'Failed to create STT stream' });
           }
-          break;
+        } else {
+          safeSend({ type: 'status', message: 'listening (echo mode)' });
+        }
+      } else if (msg.type === 'end') {
+        console.log('[ws] stop recording');
+        isRecording = false;
+        if (dgStream) {
+          try { dgStream.finish(); } catch {}
+          dgStream = null;
+        }
       }
     } catch (err) {
-      console.error('[ws] json error:', err.message);
-      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message' }));
+      console.error('[ws] handler error:', err.stack || err.message);
+      safeSend({ type: 'error', message: 'Server error' });
     }
   });
 
@@ -262,29 +272,28 @@ wss.on('connection', (ws) => {
 // Text from STT → Chombi → response text → TTS
 
 async function handleAgentMessage(ws, text) {
-  // Send interim thinking status
-  ws.send(JSON.stringify({ type: 'status', message: 'thinking...' }));
-
   try {
-    // Import and use OpenClaw's session mechanism
+    if (ws.readyState !== ws.OPEN) return;
+    ws.send(JSON.stringify({ type: 'status', message: 'thinking...' }));
+
     const reply = await getAgentReply(text);
 
-    // Send text reply to UI
+    if (ws.readyState !== ws.OPEN) return;
     ws.send(JSON.stringify({ type: 'reply', text: reply }));
 
-    // Stream TTS audio back (Deepgram or ElevenLabs)
+    // Stream TTS audio back
     if (deepgram || elevenlabs) {
-      setStatus('speaking');
+      broadcastStatus('speaking');
       try {
         await streamTTS(ws, reply);
       } catch (err) {
         console.error('[agent] TTS failed:', err.message);
       }
-      setStatus('listening');
+      broadcastStatus('listening');
     }
   } catch (err) {
-    console.error('[agent] error:', err.message);
-    ws.send(JSON.stringify({ type: 'error', message: 'Agent error: ' + err.message }));
+    console.error('[agent] error:', err.stack || err.message);
+    try { ws.send(JSON.stringify({ type: 'error', message: 'Agent error' })); } catch {}
   }
 }
 
@@ -325,13 +334,15 @@ async function generateResponse(text) {
 // ─── Status tracking ────────────────────────────────────────────────────────
 let currentStatus = 'idle';
 
-function setStatus(status) {
+function broadcastStatus(status) {
   currentStatus = status;
-  // Broadcast to all connected clients
+  const msg = JSON.stringify({ type: 'status', message: status });
   wss.clients.forEach((client) => {
-    if (client.readyState === client.OPEN) {
-      client.send(JSON.stringify({ type: 'status', message: status }));
-    }
+    try {
+      if (client.readyState === client.OPEN) {
+        client.send(msg);
+      }
+    } catch {}
   });
 }
 
